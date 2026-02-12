@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Copyright (c) 2026 Michael Burgus (https://github.com/NeuralDrifter)
+// Licensed under the MIT License. See LICENSE file for details.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -35,12 +37,15 @@ const PROVIDERS = {
     label: "Anthropic Claude",
     defaultModel: cfg("anthropic_model", "ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
     models: "claude-opus-4-6, claude-sonnet-4-5-20250929, claude-haiku-4-5-20251001",
+    mode: cfg("anthropic_mode", "ANTHROPIC_MODE", "cli"),   // "cli" or "api"
     apiKey: cfg("anthropic_api_key", "ANTHROPIC_API_KEY", ""),
   },
   gemini: {
     label: "Google Gemini",
     defaultModel: cfg("gemini_model", "GEMINI_MODEL", "gemini-3-pro-preview"),
     models: "gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash",
+    mode: cfg("gemini_mode", "GEMINI_MODE", "cli"),          // "cli" or "api"
+    apiKey: cfg("gemini_api_key", "GEMINI_API_KEY", ""),
   },
   deepseek: {
     label: "DeepSeek",
@@ -57,9 +62,13 @@ const PROVIDERS = {
   },
 };
 
-// --- Gemini provider (CLI-based) ---
+// ============================================================
+//  CLI providers (spawn local CLI tools)
+// ============================================================
 
-function queryGemini(prompt, model, timeoutMs) {
+// --- Gemini CLI ---
+
+function queryGeminiCLI(prompt, model, timeoutMs) {
   return new Promise((resolve, reject) => {
     const args = ["--prompt", prompt, "-o", "text"];
     if (model) args.push("--model", model);
@@ -104,9 +113,52 @@ function queryGemini(prompt, model, timeoutMs) {
   });
 }
 
+// --- Anthropic Claude CLI ---
+
+function queryAnthropicCLI(prompt, model, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const args = ["-p", prompt, "--output-format", "text"];
+    if (model) args.push("--model", model);
+    args.push("--no-session-persistence");
+
+    const proc = spawn("claude", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (c) => (stdout += c.toString()));
+    proc.stderr.on("data", (c) => (stderr += c.toString()));
+
+    const timer = setTimeout(() => {
+      proc.kill("SIGTERM");
+      reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`Claude CLI exited with code ${code}: ${stderr}`));
+      } else {
+        resolve(stdout.trim());
+      }
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn claude CLI: ${err.message}`));
+    });
+  });
+}
+
+// ============================================================
+//  API providers (direct HTTP calls)
+// ============================================================
+
 // --- Anthropic Claude API ---
 
-async function queryAnthropic(apiKey, model, prompt, timeoutMs) {
+async function queryAnthropicAPI(apiKey, model, prompt, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -139,6 +191,46 @@ async function queryAnthropic(apiKey, model, prompt, timeoutMs) {
       .map((b) => b.text)
       .join("\n") || "";
     return text.trim();
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
+}
+
+// --- Gemini API ---
+
+async function queryGeminiAPI(apiKey, model, prompt, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${body}`);
+    }
+
+    const data = await resp.json();
+    const parts = data.candidates?.[0]?.content?.parts;
+    if (!parts) throw new Error("No response from Gemini API");
+    return parts.map((p) => p.text || "").join("\n").trim();
   } catch (err) {
     clearTimeout(timer);
     if (err.name === "AbortError") {
@@ -213,7 +305,9 @@ async function resolveLMStudioModel(cfg) {
   }
 }
 
-// --- Dispatch single query ---
+// ============================================================
+//  Dispatch single query
+// ============================================================
 
 async function queryLLM(provider, prompt, model) {
   const cfg = PROVIDERS[provider];
@@ -222,27 +316,50 @@ async function queryLLM(provider, prompt, model) {
 
   switch (provider) {
     case "anthropic":
-      if (!cfg.apiKey) {
-        throw new Error(
-          "ANTHROPIC_API_KEY not set. Get one at https://console.anthropic.com/settings/keys"
-        );
+      if (cfg.mode === "api") {
+        if (!cfg.apiKey) {
+          throw new Error(
+            "Anthropic mode is 'api' but ANTHROPIC_API_KEY is not set. " +
+            "Set the key or switch to cli mode (ANTHROPIC_MODE=cli)."
+          );
+        }
+        return {
+          provider,
+          label: `${cfg.label} (API)`,
+          text: await queryAnthropicAPI(cfg.apiKey, effectiveModel, prompt, TIMEOUT_MS),
+          model: effectiveModel,
+        };
+      } else {
+        return {
+          provider,
+          label: `${cfg.label} (CLI)`,
+          text: await queryAnthropicCLI(prompt, effectiveModel, TIMEOUT_MS),
+          model: effectiveModel,
+        };
       }
-      return {
-        provider,
-        label: cfg.label,
-        text: await queryAnthropic(
-          cfg.apiKey, effectiveModel, prompt, TIMEOUT_MS
-        ),
-        model: effectiveModel,
-      };
 
     case "gemini":
-      return {
-        provider,
-        label: cfg.label,
-        text: await queryGemini(prompt, effectiveModel, TIMEOUT_MS),
-        model: effectiveModel,
-      };
+      if (cfg.mode === "api") {
+        if (!cfg.apiKey) {
+          throw new Error(
+            "Gemini mode is 'api' but GEMINI_API_KEY is not set. " +
+            "Set the key or switch to cli mode (GEMINI_MODE=cli)."
+          );
+        }
+        return {
+          provider,
+          label: `${cfg.label} (API)`,
+          text: await queryGeminiAPI(cfg.apiKey, effectiveModel, prompt, TIMEOUT_MS),
+          model: effectiveModel,
+        };
+      } else {
+        return {
+          provider,
+          label: `${cfg.label} (CLI)`,
+          text: await queryGeminiCLI(prompt, effectiveModel, TIMEOUT_MS),
+          model: effectiveModel,
+        };
+      }
 
     case "deepseek":
       if (!cfg.apiKey) {
@@ -273,17 +390,19 @@ async function queryLLM(provider, prompt, model) {
   }
 }
 
-// --- MCP Server ---
+// ============================================================
+//  MCP Server
+// ============================================================
 
 const server = new McpServer({
   name: "prism-relay",
-  version: "3.0.0",
+  version: "3.1.0",
 });
 
 const providerEnum = z
   .enum(["anthropic", "gemini", "deepseek", "lmstudio"])
   .describe(
-    "anthropic = Anthropic Claude API (cloud). gemini = Google Gemini (CLI, free w/ subscription). deepseek = DeepSeek API (cloud). lmstudio = local LM Studio."
+    "anthropic = Anthropic Claude (cli or api mode). gemini = Google Gemini (cli or api mode). deepseek = DeepSeek API (cloud). lmstudio = local LM Studio."
   );
 
 // Tool 1: Single provider query
@@ -294,7 +413,7 @@ server.tool(
     provider: providerEnum,
     prompt: z.string().describe("The question or analysis request to send."),
     model: z.string().optional().describe(
-      "Model override. Defaults: anthropic=claude-sonnet-4-5-20250929, gemini=gemini-3-pro-preview, deepseek=deepseek-chat, lmstudio=auto-detect."
+      "Model override. Defaults: anthropic=claude-sonnet-4-5-20250929, gemini=gemini-3-pro-preview, deepseek=deepseek-reasoner, lmstudio=auto-detect."
     ),
     context: z.string().optional().describe(
       "Optional context to prepend (file contents, error logs, etc)."
@@ -400,22 +519,43 @@ server.tool(
   "List available LLM providers and their live status.",
   {},
   async () => {
+    const { execSync } = await import("child_process");
     const lines = [];
+
     for (const [id, cfg] of Object.entries(PROVIDERS)) {
       let status = "unknown";
+      let mode = "";
 
-      if (id === "anthropic") {
-        status = cfg.apiKey
-          ? "available (API key set)"
-          : "unavailable (ANTHROPIC_API_KEY not set)";
-      } else if (id === "gemini") {
-        try {
-          const { execSync } = await import("child_process");
-          execSync("which gemini", { stdio: "ignore" });
-          status = "available (CLI installed)";
-        } catch {
-          status = "unavailable (gemini CLI not found)";
+      if (id === "anthropic" || id === "gemini") {
+        const cliName = id === "anthropic" ? "claude" : "gemini";
+        mode = ` [mode: ${cfg.mode}]`;
+
+        if (cfg.mode === "api") {
+          status = cfg.apiKey
+            ? "available (API key set)"
+            : `unavailable (${id.toUpperCase()}_API_KEY not set)`;
+        } else {
+          try {
+            execSync(`which ${cliName}`, { stdio: "ignore" });
+            status = `available (${cliName} CLI installed)`;
+          } catch {
+            status = `unavailable (${cliName} CLI not found)`;
+          }
         }
+
+        // Also show fallback info
+        const hasKey = !!cfg.apiKey;
+        let hasCli = false;
+        try {
+          execSync(`which ${cliName}`, { stdio: "ignore" });
+          hasCli = true;
+        } catch {}
+
+        const altMode = cfg.mode === "cli" ? "api" : "cli";
+        const altReady = cfg.mode === "cli"
+          ? (hasKey ? "ready" : "needs key")
+          : (hasCli ? "ready" : "not installed");
+        status += ` | ${altMode}: ${altReady}`;
       } else if (id === "deepseek") {
         status = cfg.apiKey
           ? "available (API key set)"
@@ -434,7 +574,7 @@ server.tool(
       }
 
       lines.push(
-        `${cfg.label} [${id}]\n  Default model: ${cfg.defaultModel || "(auto-detect)"}\n  Models: ${cfg.models}\n  Status: ${status}`
+        `${cfg.label} [${id}]${mode}\n  Default model: ${cfg.defaultModel || "(auto-detect)"}\n  Models: ${cfg.models}\n  Status: ${status}`
       );
     }
 

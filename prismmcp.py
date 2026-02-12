@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Michael Burgus (https://github.com/NeuralDrifter)
+# Licensed under the MIT License. See LICENSE file for details.
 """
 Prism-Relay MCP Settings — curses TUI and tkinter GUI for managing
 LLM provider configuration (API keys, models, endpoints, timeouts).

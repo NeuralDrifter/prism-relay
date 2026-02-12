@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Michael Burgus (https://github.com/NeuralDrifter)
+# Licensed under the MIT License. See LICENSE file for details.
 set -e
 
 # ── Prism-Relay MCP Server — Linux/macOS Installer ──────────────────────────

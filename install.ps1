@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Michael Burgus (https://github.com/NeuralDrifter)
+# Licensed under the MIT License. See LICENSE file for details.
 # ── Prism-Relay MCP Server — Windows Installer (PowerShell) ──────────────────
 # Run as: .\install.ps1
 # Requires: PowerShell 5.1+, Node.js 18+, Python 3.8+ (optional)
