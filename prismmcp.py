@@ -84,6 +84,10 @@ TABS = [
             ("true",  "On"),
             ("false", "Off"),
         ], "true", ""),
+        ("log_conversations", "Log Conversations", "choice", [
+            ("true",  "On"),
+            ("false", "Off"),
+        ], "true", "LOG_CONVERSATIONS"),
     ]),
 ]
 
